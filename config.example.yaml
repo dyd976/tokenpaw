@@ -1,0 +1,36 @@
+database:
+  path: ./data/token-monitor.db
+
+pricing:
+  path: ./pricing.yaml
+
+collectors:
+  claude:
+    enabled: true
+    paths:
+      - ~/.claude/projects
+  codex:
+    enabled: true
+    paths:
+      - ~/.codex/sessions
+
+monitoring:
+  polling_interval: 5
+
+alerts:
+  context_spike_percent: 100
+  context_spike_tokens: 50000
+  cache_drop_percent: 50
+  large_tool_output: 50000
+  large_file_read: 50000
+  context_warning: 70
+  context_critical: 85
+  repeated_file_reads: 5
+  repeated_context_count: 3
+  fanout_count: 5
+
+privacy:
+  store_prompt_content: true
+  store_tool_output: false
+  store_file_content: false
+  mask_sensitive_strings: true

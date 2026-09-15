@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-agent-token-control-center"
+version = "0.1.0"
+description = "Local observability collector for AI coding agent token usage"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+agent-token-monitor = "agent_token_monitor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_token_monitor*"]

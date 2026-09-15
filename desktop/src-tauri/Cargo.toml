@@ -1,0 +1,22 @@
+[package]
+name = "ai-agent-token-control-center"
+version = "0.1.0"
+description = "Local AI agent token observability desktop companion"
+authors = ["AI Agent Token Control Center"]
+edition = "2021"
+
+[lib]
+name = "ai_agent_token_control_center_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.2", features = [] }
+
+[dependencies]
+tauri = { version = "2.5", features = ["tray-icon"] }
+tauri-plugin-shell = "2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
