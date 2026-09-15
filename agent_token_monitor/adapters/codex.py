@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 from agent_token_monitor.adapters.base import AgentAdapter
 from agent_token_monitor.models import ContextItemData, NormalizedEvent, ToolCallData, Usage
-from agent_token_monitor.utils import content_hash, estimate_tokens, first_value, parse_timestamp, text_from_content
+from agent_token_monitor.utils import content_hash, first_value, parse_timestamp, text_from_content
 
 
 class CodexAdapter(AgentAdapter):
@@ -83,7 +83,7 @@ class CodexAdapter(AgentAdapter):
             target = first_value(arg_value, "command", "cmd", "path", "file_path", "url") if isinstance(arg_value, dict) else None
             tool = ToolCallData(external_call_id=call_id, tool_name=name, started_at=timestamp,
                                 input_size=len(str(arguments)) if arguments is not None else 0,
-                                estimated_tokens=estimate_tokens(arguments), target=str(target) if target else None,
+                                estimated_tokens=None, target=str(target) if target else None,
                                 file_path=str(first_value(arg_value, "path", "file_path")) if isinstance(arg_value, dict) and first_value(arg_value, "path", "file_path") else None)
             state.setdefault("pending_calls", {})[call_id] = {"name": name, "turn_id": state.get("current_turn_id"),
                                                                "target": str(target) if target else None,
@@ -99,17 +99,17 @@ class CodexAdapter(AgentAdapter):
             tool_name = str(pending.get("name") or "unknown")
             context_type = self._context_type(tool_name, pending.get("target"))
             tool = ToolCallData(external_call_id=call_id, tool_name=tool_name, ended_at=timestamp,
-                                output_size=len(str(output)) if output is not None else 0, estimated_tokens=estimate_tokens(output),
+                                output_size=len(str(output)) if output is not None else 0, estimated_tokens=None,
                                 target=pending.get("target"), file_path=pending.get("file_path"))
             return [self._event(event, source_file, line_number, "tool_result", session_id,
                                 pending.get("turn_id") or state.get("current_turn_id"), state.get("cli_version"), state,
                                 timestamp, event_id=f"{ordinal}:{call_id}:output", tool_call=tool,
                                 context_items=[ContextItemData(item_type=context_type, source=f"codex.{context_type}",
-                                                               token_count=estimate_tokens(output), content_hash=content_hash(output),
+                                                               token_count=None, content_hash=content_hash(output),
                                                                file_path=pending.get("file_path"), tool_name=tool_name,
                                                                mcp_server=pending.get("target") if context_type == "mcp" else None,
                                                                subagent_name=tool_name if context_type == "subagent" else None,
-                                                               is_estimated=True)],
+                                                               is_estimated=False)],
                                 raw_type=payload_type)]
 
         if envelope_type == "response_item" and payload_type == "message" and payload.get("role") == "user":
@@ -119,7 +119,7 @@ class CodexAdapter(AgentAdapter):
             return [self._event(event, source_file, line_number, "user_prompt", session_id, turn_id,
                                 state.get("cli_version"), state, timestamp, prompt_text=text,
                                 context_items=[ContextItemData(item_type="user_prompt", source="codex.message",
-                                       token_count=estimate_tokens(text), content_hash=content_hash(text), is_estimated=True)],
+                                       token_count=None, content_hash=content_hash(text), is_estimated=False)],
                                 raw_type=payload_type)]
         return []
 

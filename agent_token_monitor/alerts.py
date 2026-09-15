@@ -36,8 +36,9 @@ class AlertEngine:
         for session in sessions:
             turns = self.store.turns(session["id"])
             created += self._session_rules(session, turns)
-            created += self._tool_rules(session, turns)
-            created += self._context_rules(session, turns)
+            # Tool/file/context records are useful evidence, but their token
+            # contribution is not provider-reported. Actual-only alerts must
+            # therefore be based on measured turn usage only.
         self.store.connection.commit()
         return created
 

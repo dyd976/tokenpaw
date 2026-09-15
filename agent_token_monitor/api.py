@@ -230,7 +230,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
              project, project, project, model, model, session_id, session_id, git_repository, git_repository, git_branch, git_branch, alert_type, alert_type,
              min_tokens, min_tokens, max_tokens, max_tokens, min_cost, min_cost, max_cost, max_cost),
         ).fetchone()
-        period["estimated_cost"] = cost_row["estimated_cost"]
+        # Billing is not present in provider transcripts. Do not expose a
+        # pricing-table calculation as if it were an actual charge.
+        period["estimated_cost"] = None
+        period["cost_available"] = False
         period_agents: dict[str, dict[str, Any]] = {}
         for bucket in period_rows:
             for agent_name, usage in bucket.get("agents", {}).items():

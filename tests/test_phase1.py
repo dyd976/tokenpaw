@@ -125,6 +125,36 @@ class Phase1Tests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_prompt_coverage_separates_unlinked_actual_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "rollout.jsonl"
+            log.write_text((ROOT / "fixtures" / "codex_sample.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+            store = SQLiteStore(root / "monitor.db")
+            try:
+                Collector(store).scan([root])
+                unlinked = NormalizedEvent(
+                    agent_name="Codex", provider="openai", source_file="rollout.jsonl", line_number=99,
+                    event_kind="turn_usage", event_id="unlinked-usage", turn_id="turn-2",
+                    session_id="codex-session-1", timestamp=parse_timestamp("2026-09-11T01:01:00Z"),
+                    cwd="C:/workspace/demo", model="gpt-5.6-terra",
+                    usage=Usage(input_tokens=1000, cached_input_tokens=200, fresh_input_tokens=800, output_tokens=100),
+                )
+                store.ingest(unlinked)
+                session = store.sessions()[0]
+                coverage = session["prompt_coverage"]
+                self.assertEqual(coverage["status"], "PARTIAL")
+                self.assertEqual(coverage["linked_prompt_turns"], 1)
+                self.assertEqual(coverage["unlinked_usage_turns"], 1)
+                self.assertEqual(coverage["actual_tokens"], 3400)
+                self.assertEqual(coverage["linked_actual_tokens"], 2300)
+                self.assertEqual(coverage["unlinked_actual_tokens"], 1100)
+                turns = store.turns(session["id"])
+                self.assertTrue(next(turn for turn in turns if turn["external_turn_id"] == "turn-1")["prompt_linked"])
+                self.assertFalse(next(turn for turn in turns if turn["external_turn_id"] == "turn-2")["prompt_linked"])
+            finally:
+                store.close()
+
     def test_aggregate_lists_sort_by_effective_usage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -173,12 +203,11 @@ class Phase1Tests(unittest.TestCase):
                 impact = store.turn_impact(first_turn_id)
                 self.assertIsNotNone(impact)
                 self.assertEqual(impact["persistent_context_turns"], 2)
-                self.assertEqual(impact["potentially_avoidable_tokens"], 200)
+                self.assertIsNone(impact["potentially_avoidable_tokens"])
                 self.assertEqual(len(impact["items"]), 1)
                 self.assertEqual(impact["items"][0]["injected_count"], 3)
-                self.assertEqual(impact["items"][0]["cumulative_tokens"], 200)
-                self.assertEqual(impact["confidence"], "Low")
-                self.assertEqual(impact["attribution_method"], "content_hash_recurrence_estimate")
+                self.assertIsNone(impact["items"][0]["cumulative_tokens"])
+                self.assertFalse(impact["token_attribution_available"])
             finally:
                 store.close()
 
@@ -214,8 +243,10 @@ class Phase1Tests(unittest.TestCase):
                                                                             reasoning_tokens=10))
                 self.assertTrue(store.ingest(event))
                 turn = store.turns(store.sessions()[0]["id"])[0]
-                self.assertAlmostEqual(turn["estimated_cost"], 0.00103)
-                self.assertAlmostEqual(store.summary()["estimated_cost"], 0.00103)
+                self.assertIsNone(turn["estimated_cost"])
+                self.assertFalse(turn["cost_available"])
+                self.assertIsNone(store.summary()["estimated_cost"])
+                self.assertFalse(store.summary()["cost_available"])
             finally:
                 store.close()
 
@@ -349,7 +380,11 @@ class Phase1Tests(unittest.TestCase):
                 types = {row[0] for row in store.connection.execute("SELECT type FROM alerts")}
                 self.assertIn("CONTEXT_SPIKE", types)
                 self.assertIn("CACHE_DROP", types)
-                self.assertIn("LARGE_TOOL_OUTPUT", types)
+                self.assertNotIn("LARGE_TOOL_OUTPUT", types)
+                self.assertNotIn("LARGE_FILE_READ", types)
+                self.assertNotIn("REPEATED_CONTEXT", types)
+                self.assertNotIn("REPEATED_FILE_READ", types)
+                self.assertNotIn("AGENT_FANOUT", types)
                 self.assertNotIn("SESSION_LOG_INGESTION", types)
             finally:
                 store.close()

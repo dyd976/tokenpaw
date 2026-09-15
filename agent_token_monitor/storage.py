@@ -14,6 +14,7 @@ from agent_token_monitor.models import NormalizedEvent
 from agent_token_monitor.pricing import PricingTable
 from agent_token_monitor.utils import canonical_json, mask_sensitive_strings, parse_timestamp, stable_id
 
+ACTUAL_USAGE_ALERT_TYPES = ("CONTEXT_SPIKE", "CACHE_DROP", "ABNORMAL_BURN", "CONTEXT_PRESSURE")
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -424,6 +425,8 @@ class SQLiteStore:
         result = dict(row)
         result["effective_input_tokens"] = result["cached_tokens"] + result["fresh_tokens"] or result["input_tokens"]
         result["total_tokens"] = result["effective_input_tokens"] + result["output_tokens"]
+        result["estimated_cost"] = None
+        result["cost_available"] = False
         denominator = result["cached_tokens"] + result["fresh_tokens"]
         result["cache_hit_rate"] = (result["cached_tokens"] / denominator) if denominator else None
         return result
@@ -439,6 +442,8 @@ class SQLiteStore:
             item["total_tokens"] = input_tokens + (output_tokens or 0)
         item["usage_quality"] = "Mixed" if actual and estimated else "Estimated" if estimated else "Actual"
         item["has_estimates"] = bool(estimated)
+        item["estimated_cost"] = None
+        item["cost_available"] = False
         return item
 
     def _add_health_status(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -449,6 +454,68 @@ class SQLiteStore:
         ).fetchall()
         severities = {row["severity"] for row in rows}
         item["health_status"] = "CRITICAL" if "CRITICAL" in severities else "WARNING" if "WARNING" in severities else item.get("status")
+        return item
+
+    def _prompt_linked(self, turn_id: str) -> bool:
+        """Return whether the provider usage turn has a recorded user prompt event.
+
+        This deliberately checks the event marker rather than ``user_prompt`` text:
+        prompt content may be disabled by the privacy setting while the linkage is
+        still available and trustworthy.
+        """
+        row = self.connection.execute(
+            "SELECT 1 FROM context_items WHERE turn_id=? AND type='user_prompt' LIMIT 1",
+            (turn_id,),
+        ).fetchone()
+        return row is not None
+
+    def _prompt_coverage(self, session_id: str, *, start: str | None = None,
+                         end: str | None = None) -> dict[str, Any]:
+        """Summarize which provider-measured usage can be linked to a prompt.
+
+        Token values here are provider-recorded turn totals only. No attribution is
+        made from a prompt to a file, tool, or later context.
+        """
+        turns = self.turns(session_id, start=start, end=end)
+        measured = [turn for turn in turns if not bool(turn.get("is_estimated")) and any(
+            turn.get(key) is not None for key in (
+                "input_tokens", "cached_input_tokens", "fresh_input_tokens",
+                "output_tokens", "reasoning_tokens"))]
+        linked = [turn for turn in measured if bool(turn.get("prompt_linked"))]
+        unlinked = [turn for turn in measured if not bool(turn.get("prompt_linked"))]
+
+        def total(turn: dict[str, Any]) -> int:
+            return self._effective_input(turn) + (turn.get("output_tokens") or 0)
+
+        actual_tokens = sum(total(turn) for turn in measured)
+        linked_tokens = sum(total(turn) for turn in linked)
+        unlinked_tokens = sum(total(turn) for turn in unlinked)
+        coverage = linked_tokens / actual_tokens if actual_tokens else None
+        if not measured:
+            status = "NO_DATA"
+        elif not linked:
+            status = "UNAVAILABLE"
+        elif unlinked:
+            status = "PARTIAL"
+        else:
+            status = "COMPLETE"
+        return {
+            "status": status,
+            "actual_usage_turns": len(measured),
+            "linked_prompt_turns": len(linked),
+            "unlinked_usage_turns": len(unlinked),
+            "prompt_content_stored_turns": sum(bool(turn.get("user_prompt")) for turn in linked),
+            "actual_tokens": actual_tokens,
+            "linked_actual_tokens": linked_tokens,
+            "unlinked_actual_tokens": unlinked_tokens,
+            "linked_token_coverage": coverage,
+            "token_attribution_available": False,
+            "note": "프롬프트가 연결된 턴의 provider 기록만 묶었습니다. 미연결 usage와 활동별 토큰 원인은 별도로 유지합니다.",
+        }
+
+    def _add_prompt_coverage(self, item: dict[str, Any], *, start: str | None = None,
+                             end: str | None = None) -> dict[str, Any]:
+        item["prompt_coverage"] = self._prompt_coverage(item["id"], start=start, end=end)
         return item
 
     def sessions(self, *, start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
@@ -484,7 +551,7 @@ class SQLiteStore:
                 item["effective_input_tokens"] = item["total_cached_input_tokens"] + item["total_fresh_input_tokens"] or item["total_input_tokens"]
                 denominator = item["total_cached_input_tokens"] + item["total_fresh_input_tokens"]
                 item["cache_hit_rate"] = item["total_cached_input_tokens"] / denominator if denominator else None
-                result.append(self._add_health_status(self._add_usage_quality(item)))
+                result.append(self._add_prompt_coverage(self._add_health_status(self._add_usage_quality(item)), start=start, end=end))
             return result
         rows = self.connection.execute("""SELECT s.*, a.name AS agent_name, a.provider, p.project_name, p.project_path,
             p.git_repository, p.git_branch,
@@ -505,7 +572,7 @@ class SQLiteStore:
                 (item["id"],),
             ).fetchone()
             item["context_utilization"] = context_row["context_utilization"] if context_row else None
-            result.append(self._add_health_status(self._add_usage_quality(item)))
+            result.append(self._add_prompt_coverage(self._add_health_status(self._add_usage_quality(item))))
         return result
 
     def refresh_session_status(self, *, active_minutes: int = 5, idle_minutes: int = 30) -> None:
@@ -574,6 +641,8 @@ class SQLiteStore:
         result = []
         for row in rows:
             item = dict(row)
+            item["estimated_cost"] = None
+            item["cost_available"] = False
             item["effective_input_tokens"] = item["cached_tokens"] + item["fresh_tokens"] or item["input_tokens"]
             denominator = item["cached_tokens"] + item["fresh_tokens"]
             item["cache_hit_rate"] = item["cached_tokens"] / denominator if denominator else None
@@ -668,7 +737,7 @@ class SQLiteStore:
             (session_id,),
         ).fetchone()
         item["context_utilization"] = context_row["context_utilization"] if context_row else None
-        return self._add_health_status(self._add_usage_quality(item))
+        return self._add_prompt_coverage(self._add_health_status(self._add_usage_quality(item)))
 
     def turns(self, session_id: str, *, start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
         clauses = ["session_id=?"]
@@ -687,10 +756,15 @@ class SQLiteStore:
         previous_fresh: int | None = None
         for row in rows:
             item = dict(row)
+            item["estimated_cost"] = None
+            item["cost_available"] = False
             current_input = self._effective_input(item)
             current_fresh = item.get("fresh_input_tokens")
             item["effective_input_tokens"] = current_input
             item["total_tokens"] = current_input + (item.get("output_tokens") or 0)
+            item["prompt_linked"] = self._prompt_linked(item["id"])
+            item["prompt_content_stored"] = bool(item.get("user_prompt"))
+            item["prompt_linkage"] = "linked" if item["prompt_linked"] else "unlinked"
             item["input_before_tokens"] = previous_input
             item["input_after_tokens"] = current_input
             item["input_delta_tokens"] = current_input - previous_input if previous_input is not None else 0
@@ -705,16 +779,19 @@ class SQLiteStore:
         if row is None:
             return None
         item = dict(row)
+        item["estimated_cost"] = None
+        item["cost_available"] = False
         item["effective_input_tokens"] = self._effective_input(item)
         item["total_tokens"] = item["effective_input_tokens"] + (item.get("output_tokens") or 0)
         sequence = self.turns(item["session_id"])
         decorated = next((value for value in sequence if value["id"] == turn_id), None)
         if decorated is not None:
-            for key in ("input_before_tokens", "input_after_tokens", "input_delta_tokens", "fresh_context_added_tokens"):
+            for key in ("input_before_tokens", "input_after_tokens", "input_delta_tokens", "fresh_context_added_tokens",
+                        "prompt_linked", "prompt_content_stored", "prompt_linkage"):
                 item[key] = decorated[key]
-        item["context_items"] = [dict(value) for value in self.connection.execute(
+        item["context_items"] = [self._public_context_item(dict(value)) for value in self.connection.execute(
             "SELECT * FROM context_items WHERE turn_id=? ORDER BY id", (turn_id,)).fetchall()]
-        item["tool_calls"] = [dict(value) for value in self.connection.execute(
+        item["tool_calls"] = [self._public_tool_call(dict(value)) for value in self.connection.execute(
             "SELECT * FROM tool_calls WHERE turn_id=? ORDER BY started_at, id", (turn_id,)).fetchall()]
         tool_names = [str(tool.get("tool_name") or "").lower() for tool in item["tool_calls"]]
         item["tool_summary"] = {
@@ -722,21 +799,13 @@ class SQLiteStore:
             "files_read": sum(bool(tool.get("file_path")) for tool in item["tool_calls"]),
             "mcp_calls": sum("mcp" in name for name in tool_names),
             "subagents": sum(any(marker in name for marker in ("agent", "subagent", "task")) for name in tool_names),
-            "estimated_tool_tokens": sum(tool.get("estimated_tokens") or 0 for tool in item["tool_calls"]),
-            "is_estimated": bool(item["tool_calls"]),
+            "token_attribution_available": False,
         }
-        item["likely_cause"] = self._alert_cause(turn_id)
+        item["likely_cause"] = None
         return item
 
     def turn_impact(self, turn_id: str) -> dict[str, Any] | None:
-        """Estimate how context items introduced by a turn recur in later turns.
-
-        Providers do not expose a complete per-token attribution graph. This method
-        therefore only attributes repeated content hashes. A hash is counted at most
-        once per later turn, even when that turn contains multiple records for the
-        same content. The token impact is consequently a recurrence estimate, not a
-        provider-supplied attribution value.
-        """
+        """Report observed context recurrence without inventing token impact."""
         turn = self.turn(turn_id)
         if turn is None:
             return None
@@ -748,7 +817,7 @@ class SQLiteStore:
         introduced_by_hash: dict[str, list[dict[str, Any]]] = {}
         for item in turn["context_items"]:
             content_hash = item.get("content_hash")
-            if content_hash and (item.get("token_count") or 0) > 0:
+            if content_hash:
                 introduced_by_hash.setdefault(str(content_hash), []).append(item)
         items: list[dict[str, Any]] = []
         affected_later_turn_ids: set[str] = set()
@@ -762,47 +831,34 @@ class SQLiteStore:
                 if match:
                     repeated_turn_ids.append(later["id"])
                     affected_later_turn_ids.add(later["id"])
-            # The same content can arrive through multiple adapter signals (for
-            # example file + tool_result). Use one representative token count.
-            context = max(same_hash_items, key=lambda item: int(item.get("token_count") or 0))
-            token_count = int(context.get("token_count") or 0)
+            context = same_hash_items[0]
             items.append({
                 "type": context.get("type"),
                 "source": context.get("source"),
                 "file_path": context.get("file_path"),
                 "tool_name": context.get("tool_name"),
                 "content_hash": content_hash,
-                "unique_tokens": token_count,
+                "unique_tokens": None,
                 "injected_count": 1 + len(repeated_turn_ids),
                 "subsequent_turns": len(repeated_turn_ids),
-                "cumulative_tokens": token_count * len(repeated_turn_ids),
-                "is_estimated": True,
-                "confidence": "Low",
-                "attribution_method": "content_hash_recurrence_estimate",
+                "cumulative_tokens": None,
+                "token_attribution_available": False,
             })
         persistent = len(affected_later_turn_ids)
-        avoidable = sum(item["cumulative_tokens"] for item in items)
         return {
             "turn_id": turn_id,
             "session_id": turn["session_id"],
             "initial_effective_input_tokens": self._effective_input(turn),
             "persistent_context_turns": persistent,
-            "persistent_context_impact_tokens": avoidable,
-            "potentially_avoidable_tokens": avoidable,
-            "is_estimated": bool(items),
-            "confidence": "Low" if items else None,
-            "attribution_method": "content_hash_recurrence_estimate",
-            "attribution_note": "Provider logs do not expose per-context token attribution; repeated content hashes are used to estimate later-turn impact.",
+            "persistent_context_impact_tokens": None,
+            "potentially_avoidable_tokens": None,
+            "token_attribution_available": False,
+            "attribution_note": "반복된 content hash와 이후 턴 수만 실제 기록으로 확인했습니다. provider가 원인별 토큰 귀속을 제공하지 않아 영향 토큰은 계산하지 않습니다.",
             "items": items,
         }
 
     def session_timeline(self, session_id: str, *, start: str | None = None, end: str | None = None) -> list[dict[str, Any]] | None:
-        """Build a diagnostic timeline from provider turns and normalized side events.
-
-        Provider logs do not always expose a single ordered event stream for context
-        assembly. Turn timestamps are therefore used as the stable ordering anchor;
-        context items and tool calls remain explicitly marked as estimated metadata.
-        """
+        """Build a timeline of measured turns and observed side events."""
         if self.session(session_id) is None:
             return None
         events: list[dict[str, Any]] = []
@@ -825,8 +881,10 @@ class SQLiteStore:
                 "output_tokens": turn.get("output_tokens"),
                 "reasoning_tokens": turn.get("reasoning_tokens"),
                 "total_tokens": effective_input + (turn.get("output_tokens") or 0),
-                "estimated_cost": turn.get("estimated_cost"),
-                "is_estimated": not measured or bool(turn.get("is_estimated")),
+                "estimated_cost": None,
+                "cost_available": False,
+                "is_estimated": False,
+                "token_count_available": measured,
                 "sequence": sequence,
             })
             context_items = [dict(row) for row in self.connection.execute(
@@ -842,13 +900,14 @@ class SQLiteStore:
                     "timestamp": turn.get("timestamp"),
                     "turn_id": turn["id"],
                     "title": item.get("file_path") or item.get("tool_name") or item.get("type") or "Context item",
-                    "token_count": item.get("token_count"),
+                    "token_count": None,
                     "file_path": item.get("file_path"),
                     "tool_name": item.get("tool_name"),
                     "mcp_server": item.get("mcp_server"),
                     "subagent_name": item.get("subagent_name"),
                     "content_hash": item.get("content_hash"),
-                    "is_estimated": bool(item.get("is_estimated")),
+                    "is_estimated": False,
+                    "token_count_available": False,
                     "sequence": sequence,
                 })
             for tool in tool_calls:
@@ -864,24 +923,29 @@ class SQLiteStore:
                     "file_path": tool.get("file_path"),
                     "input_size": tool.get("input_size"),
                     "output_size": tool.get("output_size"),
-                    "token_count": tool.get("estimated_tokens"),
-                    "is_estimated": True,
+                    "token_count": None,
+                    "token_count_available": False,
                     "sequence": sequence,
                 })
         events.sort(key=lambda item: (parse_timestamp(item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc), item["sequence"]))
         return events
 
     def session_insights(self, session_id: str, *, start: str | None = None, end: str | None = None) -> dict[str, Any] | None:
-        """Return diagnostic aggregates used by the desktop session view."""
+        """Return provider-measured usage and observed activity only.
+
+        Provider logs do not expose a complete context-to-token attribution graph,
+        so this method intentionally never reports tool/context token estimates.
+        """
         session = self.session(session_id)
         if session is None:
             return None
         turns = self.turns(session_id, start=start, end=end)
-        measured = [turn for turn in turns if self._effective_input(turn) > 0]
-        effective_input = sum(self._effective_input(turn) for turn in turns)
-        output = sum(turn.get("output_tokens") or 0 for turn in turns)
-        cached = sum(turn.get("cached_input_tokens") or 0 for turn in turns)
-        fresh = sum(turn.get("fresh_input_tokens") or 0 for turn in turns)
+        measured = [turn for turn in turns if not bool(turn.get("is_estimated")) and any(
+            turn.get(key) is not None for key in ("input_tokens", "cached_input_tokens", "fresh_input_tokens", "output_tokens", "reasoning_tokens"))]
+        effective_input = sum(self._effective_input(turn) for turn in measured)
+        output = sum(turn.get("output_tokens") or 0 for turn in measured)
+        cached = sum(turn.get("cached_input_tokens") or 0 for turn in measured)
+        fresh = sum(turn.get("fresh_input_tokens") or 0 for turn in measured)
         cache_rate = cached / (cached + fresh) if cached + fresh else None
         spikes: list[dict[str, Any]] = []
         for index, current in enumerate(measured):
@@ -898,7 +962,6 @@ class SQLiteStore:
         tools = [dict(row) for row in self.connection.execute(
             f"SELECT * FROM tool_calls WHERE turn_id IN ({placeholders})", turn_ids
         ).fetchall()] if turn_ids else []
-        estimated_tool_tokens = sum(tool.get("estimated_tokens") or 0 for tool in tools)
         context_rows = [dict(row) for row in self.connection.execute(
             f"SELECT * FROM context_items WHERE turn_id IN ({placeholders})", turn_ids
         ).fetchall()] if turn_ids else []
@@ -910,29 +973,22 @@ class SQLiteStore:
         attribution: dict[str, dict[str, Any]] = {}
         for item in context_rows:
             item_type = str(item.get("type") or "other")
-            bucket = attribution.setdefault(item_type, {"type": item_type, "items": 0, "token_count": 0,
-                                                        "estimated_items": 0})
+            bucket = attribution.setdefault(item_type, {"type": item_type, "items": 0})
             bucket["items"] += 1
-            bucket["token_count"] += item.get("token_count") or 0
-            bucket["estimated_items"] += int(bool(item.get("is_estimated")))
-        avoidable = 0
         repeated_items: list[dict[str, Any]] = []
         for items in repeated_contexts:
-            token_count = max((item.get("token_count") or 0) for item in items)
             occurrences = len({item["turn_id"] for item in items})
-            avoidable += token_count * max(occurrences - 1, 0)
             sample = items[0]
             repeated_items.append({"type": sample.get("type"), "file_path": sample.get("file_path"),
                                    "tool_name": sample.get("tool_name"), "injected_count": occurrences,
-                                   "unique_tokens": token_count, "cumulative_tokens": token_count * occurrences,
-                                   "potentially_avoidable_tokens": token_count * max(occurrences - 1, 0)})
+                                   "token_attribution_available": False})
         file_counts: dict[str, int] = {}
         for tool in tools:
             if tool.get("file_path"):
                 file_counts[tool["file_path"]] = file_counts.get(tool["file_path"], 0) + 1
         duplicate_files = len([path for path in file_counts.values() if path >= 2])
         if start or end:
-            alert_clauses = ["session_id=?", "type <> 'SESSION_LOG_INGESTION'"]
+            alert_clauses = ["session_id=?", "type IN ('CONTEXT_SPIKE','CACHE_DROP','ABNORMAL_BURN','CONTEXT_PRESSURE')"]
             alert_params: list[Any] = [session_id]
             if start:
                 alert_clauses.append("datetime(timestamp) >= datetime(?)")
@@ -944,41 +1000,36 @@ class SQLiteStore:
                 f"SELECT COUNT(*) FROM alerts WHERE {' AND '.join(alert_clauses)}", alert_params
             ).fetchone()[0]
         else:
-            alert_count = self.connection.execute("SELECT COUNT(*) FROM alerts WHERE session_id=? AND type <> 'SESSION_LOG_INGESTION'", (session_id,)).fetchone()[0]
-        cache_penalty = (1 - cache_rate) * 25 if cache_rate is not None else 0
-        repeat_penalty = min(35, (avoidable / effective_input) * 35) if effective_input else 0
-        tool_penalty = min(25, (estimated_tool_tokens / effective_input) * 25) if effective_input else 0
-        spike_penalty = min(15, len(spikes) * 3)
-        efficiency = round(max(0, min(100, 100 - cache_penalty - repeat_penalty - tool_penalty - spike_penalty)))
-        top_tools = sorted(({
-            "tool_name": tool.get("tool_name"), "target": tool.get("target"),
-            "estimated_tokens": tool.get("estimated_tokens") or 0,
-        } for tool in tools), key=lambda item: item["estimated_tokens"], reverse=True)[:5]
-        turn_costs = [turn.get("estimated_cost") for turn in turns if turn.get("estimated_cost") is not None]
+            alert_count = self.connection.execute("SELECT COUNT(*) FROM alerts WHERE session_id=? AND type IN ('CONTEXT_SPIKE','CACHE_DROP','ABNORMAL_BURN','CONTEXT_PRESSURE')", (session_id,)).fetchone()[0]
+        tool_activity: dict[str, dict[str, Any]] = {}
+        for tool in tools:
+            name = str(tool.get("tool_name") or "unknown")
+            activity = tool_activity.setdefault(name, {"tool_name": name, "calls": 0, "targets": []})
+            activity["calls"] += 1
+            if tool.get("target") and tool["target"] not in activity["targets"]:
+                activity["targets"].append(tool["target"])
         return {
             "session_id": session_id,
             "effective_input_tokens": effective_input,
             "cached_input_tokens": cached,
             "fresh_input_tokens": fresh,
             "output_tokens": output,
-            "estimated_cost": sum(turn_costs) if turn_costs else None,
+            "estimated_cost": None,
             "cache_hit_rate": cache_rate,
-            "actual_turns": sum(not bool(turn.get("is_estimated")) for turn in turns),
-            "estimated_turns": sum(bool(turn.get("is_estimated")) for turn in turns),
+            "actual_turns": len(measured),
+            "estimated_turns": 0,
             "tool_calls": len(tools),
-            "estimated_tool_tokens": estimated_tool_tokens,
             "context_items": len(context_rows),
-            "context_attribution": sorted(attribution.values(), key=lambda item: item["token_count"], reverse=True),
+            "context_attribution": sorted(attribution.values(), key=lambda item: item["items"], reverse=True),
             "repeated_context_items": len(repeated_contexts),
-            "potentially_avoidable_tokens": avoidable,
             "duplicate_file_paths": duplicate_files,
             "spikes": spikes[:20],
             "alerts": alert_count,
-            "efficiency_score": efficiency,
-            "efficiency_score_is_heuristic": True,
-            "efficiency_formula": "100 - cache penalty (0-25) - repeated context penalty (0-35) - tool output penalty (0-25) - spike penalty (0-15)",
-            "top_tools": top_tools,
-            "repeated_contexts": sorted(repeated_items, key=lambda item: item["potentially_avoidable_tokens"], reverse=True)[:10],
+            "token_attribution_available": False,
+            "cost_available": False,
+            "prompt_coverage": self._prompt_coverage(session_id, start=start, end=end),
+            "tool_activity": sorted(tool_activity.values(), key=lambda item: item["calls"], reverse=True)[:10],
+            "repeated_contexts": sorted(repeated_items, key=lambda item: item["injected_count"], reverse=True)[:10],
         }
 
     def _file_read_counts(self, session_id: str) -> dict[str, int]:
@@ -999,9 +1050,8 @@ class SQLiteStore:
     def alerts(self, *, resolved: bool | None = None, alert_type: str | None = None,
                severity: str | None = None, agent: str | None = None,
                start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
-        # Path-only session-log matches are ambiguous and are no longer user-facing alerts.
-        # Keep historical rows for auditability, but exclude them from diagnostics.
-        clauses: list[str] = ["al.type <> 'SESSION_LOG_INGESTION'"]
+        # Only alerts based on provider-measured usage are user-facing.
+        clauses: list[str] = ["al.type IN ('CONTEXT_SPIKE','CACHE_DROP','ABNORMAL_BURN','CONTEXT_PRESSURE')"]
         params: list[Any] = []
         if resolved is not None:
             clauses.append("al.resolved = ?")
@@ -1034,24 +1084,19 @@ class SQLiteStore:
         return result
 
     def _alert_cause(self, turn_id: str | None) -> dict[str, Any] | None:
-        if not turn_id:
-            return None
-        tool = self.connection.execute(
-            "SELECT tool_name, target, file_path, estimated_tokens, output_size FROM tool_calls WHERE turn_id=? ORDER BY estimated_tokens DESC LIMIT 1",
-            (turn_id,),
-        ).fetchone()
-        if tool is not None and (tool["estimated_tokens"] or 0) > 0:
-            return {"kind": "tool_output", "tool_name": tool["tool_name"], "target": tool["target"],
-                    "file_path": tool["file_path"], "estimated_tokens": tool["estimated_tokens"], "confidence": "High"}
-        context = self.connection.execute(
-            "SELECT type, source, file_path, tool_name, token_count, is_estimated FROM context_items WHERE turn_id=? ORDER BY token_count DESC LIMIT 1",
-            (turn_id,),
-        ).fetchone()
-        if context is not None and (context["token_count"] or 0) > 0:
-            return {"kind": context["type"], "source": context["source"], "file_path": context["file_path"],
-                    "tool_name": context["tool_name"], "estimated_tokens": context["token_count"],
-                    "confidence": "Medium" if context["is_estimated"] else "High"}
         return None
+
+    @staticmethod
+    def _public_context_item(item: dict[str, Any]) -> dict[str, Any]:
+        item["token_count"] = None
+        item["token_count_available"] = False
+        return item
+
+    @staticmethod
+    def _public_tool_call(item: dict[str, Any]) -> dict[str, Any]:
+        item["estimated_tokens"] = None
+        item["token_count_available"] = False
+        return item
 
     def search(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
         """Search locally stored metadata and optional content without reading source logs."""
@@ -1194,6 +1239,8 @@ class SQLiteStore:
         result = []
         for row in rows:
             item = dict(row)
+            item["estimated_cost"] = None
+            item["cost_available"] = False
             item["effective_input_tokens"] = item["cached_tokens"] + item["fresh_tokens"] or item["input_tokens"]
             item["total_tokens"] = item["effective_input_tokens"] + item["output_tokens"]
             denominator = item["cached_tokens"] + item["fresh_tokens"]
@@ -1319,9 +1366,15 @@ class SQLiteStore:
             if row["estimated_cost"] is not None:
                 model["estimated_cost"] = (model["estimated_cost"] or 0) + row["estimated_cost"]
         for item in buckets.values():
+            item["estimated_cost"] = None
+            item["cost_available"] = False
             item["total_tokens"] = item["effective_input_tokens"] + item["output_tokens"]
             for agent in item["agents"].values():
+                agent["estimated_cost"] = None
+                agent["cost_available"] = False
                 agent["total_tokens"] = agent["effective_input_tokens"] + agent["output_tokens"]
             for model in item["models"].values():
+                model["estimated_cost"] = None
+                model["cost_available"] = False
                 model["total_tokens"] = model["effective_input_tokens"] + model["output_tokens"]
         return list(buckets.values())

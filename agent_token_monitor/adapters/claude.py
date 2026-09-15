@@ -5,7 +5,7 @@ from typing import Any, Iterable
 
 from agent_token_monitor.adapters.base import AgentAdapter
 from agent_token_monitor.models import ContextItemData, NormalizedEvent, ToolCallData, Usage
-from agent_token_monitor.utils import content_hash, estimate_tokens, first_value, parse_timestamp, text_from_content
+from agent_token_monitor.utils import content_hash, first_value, parse_timestamp, text_from_content
 
 
 class ClaudeAdapter(AgentAdapter):
@@ -97,14 +97,14 @@ class ClaudeAdapter(AgentAdapter):
                         git_branch=branch, git_repository=repository,
                         tool_call=ToolCallData(external_call_id=tool_id, tool_name=tool_name, ended_at=timestamp,
                                                output_size=len(str(output)) if output is not None else 0,
-                                               estimated_tokens=estimate_tokens(output), target=metadata.get("target"),
+                                               estimated_tokens=None, target=metadata.get("target"),
                                                file_path=metadata.get("file_path"), is_error=bool(block.get("is_error"))),
                         context_items=[ContextItemData(item_type=context_type, source=f"claude.{context_type}",
-                                                       token_count=estimate_tokens(output), content_hash=content_hash(output),
+                                                       token_count=None, content_hash=content_hash(output),
                                                        file_path=metadata.get("file_path"), tool_name=tool_name,
                                                        mcp_server=metadata.get("target") if context_type == "mcp" else None,
                                                        subagent_name=tool_name if context_type == "subagent" else None,
-                                                       is_estimated=True)],
+                                                       is_estimated=False)],
                         raw_type=event_type,
                     ))
             elif prompt_text or message:
@@ -114,8 +114,8 @@ class ClaudeAdapter(AgentAdapter):
                     line_number=line_number, event_id=event_id, timestamp=timestamp, session_id=session_id,
                     turn_id=prompt_id, version=version, cwd=cwd, git_branch=branch, git_repository=repository,
                     prompt_text=prompt_text, context_items=[ContextItemData(item_type="user_prompt", source="claude.user",
-                                                                            token_count=estimate_tokens(prompt_text),
-                                                                            content_hash=content_hash(prompt_text), is_estimated=True)],
+                                                                            token_count=None,
+                                                                            content_hash=content_hash(prompt_text), is_estimated=False)],
                     raw_type=event_type,
                 ))
             return result
@@ -151,7 +151,7 @@ class ClaudeAdapter(AgentAdapter):
             target = first_value(payload, "command", "cmd", "url", "path", "file_path", "pattern")
             file_path = first_value(payload, "file_path", "path") if name.lower() in {"read", "readfile", "read_file"} else None
         return ToolCallData(external_call_id=str(block.get("id") or ""), tool_name=name, started_at=parse_timestamp(timestamp),
-                            input_size=len(str(payload)) if payload is not None else 0, estimated_tokens=estimate_tokens(payload),
+                            input_size=len(str(payload)) if payload is not None else 0, estimated_tokens=None,
                             target=str(target) if target is not None else None, file_path=str(file_path) if file_path else None)
 
     @staticmethod
